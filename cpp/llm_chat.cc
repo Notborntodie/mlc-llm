@@ -14,7 +14,7 @@
 #include <tvm/runtime/packed_func.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/runtime/relax_vm/ndarray_cache_support.h>
-
+#include <tvm/runtime/device_api.h>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility> 
 
 #include "./metadata/model.h"
 #include "./serve/config.h"
@@ -65,6 +66,10 @@ inline std::string Concat(const std::vector<std::string>& inputs) {
   }
   return os.str();
 }
+
+
+
+//这是函数的添加
 
 struct FunctionTable {
   static PackedFunc SessionFuncAsPackedFunc(Session sess, DRef sess_func, String name) {
@@ -292,7 +297,7 @@ struct FunctionTable {
       }
       this->fkvcache_array_popn_ = get_global_func("vm.builtin.attention_kv_cache_array_popn");
     }
-
+    this->loglikelihood_func_ = mod_get_func("loglikelihood");
     this->nd_view_func_ = get_global_func("vm.builtin.reshape");
     this->nd_get_shape_func_ = get_global_func("vm.builtin.shape_of");
   }
@@ -350,6 +355,7 @@ struct FunctionTable {
   PackedFunc kv_cache_end_forward_func_;
   bool support_backtracking_kv_;
   PackedFunc fkvcache_array_popn_;
+  PackedFunc loglikelihood_func_;
   ModelMetadata model_metadata_;
 
   PackedFunc nd_view_func_;
@@ -649,6 +655,12 @@ class LLMChat {
     ICHECK(fsample_topp_from_logits_ptr)
         << "Cannot find env function vm.builtin.sample_top_p_from_logits";
     fsample_topp_from_logits_ = *fsample_topp_from_logits_ptr;
+
+    auto flog_softmax_ptr = tvm::runtime::Registry::Get("vm.builtin.log_softmax");
+    ICHECK(flog_softmax_ptr) << "Cannot find env function vm.builtin.log_softmax";
+    flog_softmax_ = *flog_softmax_ptr;
+
+
     // Step 5. Load params in nd-array cache.
     this->params_ = ft_.LoadParams(model_path, device_, use_presharded_weights_);
     // Step 6. KV cache creation.
@@ -1003,9 +1015,7 @@ class LLMChat {
       this->prefill_total_tokens += token_len;
       return;
     }
-
     int32_t next_token = this->SampleTokenFromLogits(logits_on_device, generation_config);
-
     auto tend = std::chrono::high_resolution_clock::now();
 
     this->prefill_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
@@ -1039,12 +1049,97 @@ class LLMChat {
 
     int32_t next_token = this->SampleTokenFromLogits(logits_on_device, generation_config);
 
+
     auto tend = std::chrono::high_resolution_clock::now();
 
     this->decode_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
     this->decode_total_tokens += 1;
     this->ProcessNextToken(next_token, generation_config);
   }
+
+
+
+
+
+
+
+  std::string LogLikelihoodStep(const std::string& context, const std::string& continuation,
+                                 String generation_config_str = "") {
+     // process generation settings
+     picojson::object generation_config = picojson::object();
+     if (!generation_config_str.empty()) {
+       picojson::value generation_config_json;
+       picojson::parse(generation_config_json, generation_config_str);
+       generation_config = generation_config_json.get<picojson::object>();
+     }
+
+     std::string inp = context + continuation;
+     std::vector<int32_t> prompt_tokens = this->tokenizer_->Encode(inp);
+     //printf("prompt_tokens size: %d\n", prompt_tokens.size());
+     int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
+     if (token_len == 0) {
+       picojson::object config;
+       config["logprobes"] = picojson::value(std::numeric_limits<float>::min());
+       config["is_greedy"] = picojson::value(false);
+       config["prefill_speed"] = picojson::value(0.0);
+       return picojson::value(config).serialize(true);
+     }
+     if (ft_.use_disco) {
+       // exclude load shard time from prefill
+       this->ft_.sess->SyncWorker(0);
+     }
+
+     std::vector<int32_t> continuation_tokens = this->tokenizer_->Encode(continuation);
+     // TODO(vvchernov): strange token is added in front of continuation after encoding,
+     // There is advanced fix for any cases, but need study reason and fix it
+     int64_t i = 1;
+     int64_t cont_token_length = continuation_tokens.size();
+     for (; i <= cont_token_length; ++i) {
+       if (prompt_tokens[token_len - i] != continuation_tokens[cont_token_length - i]) {
+         break;
+       }
+     }
+     for (int64_t j = 0; j < cont_token_length + 1 - i; ++j) {
+       continuation_tokens.erase(continuation_tokens.begin());
+     }
+
+     std::vector<int32_t> cut_tokens = prompt_tokens;
+     cut_tokens.pop_back();
+
+     int64_t new_seq_len = total_seq_len_ + token_len - 1;
+     //printf("Hello! Forwarding tokens\n");
+    // printf("cut_tokens size: %d\n", cut_tokens.size());
+     //printf("new_seq_len: %d\n", new_seq_len);
+     auto tstart = std::chrono::high_resolution_clock::now();
+    NDArray logits_on_device = this->ForwardTokens(cut_tokens, new_seq_len, true);
+     //printf("logits_on_device shape: %d\n", logits_on_device.Shape().size());
+     
+    total_seq_len_ = new_seq_len;
+    auto tend = std::chrono::high_resolution_clock::now();
+
+    std::pair<float,bool>  logprobes = this->SampleLogProbeFromLogits(logits_on_device, continuation_tokens, generation_config);
+    // 访问 sum 和 is_greedy 的值
+    float sum = logprobes.first;
+    bool is_greedy = logprobes.second;
+    //auto tend = std::chrono::high_resolution_clock::now();
+
+    this->prefill_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    this->prefill_total_tokens += token_len - 1;
+    //printf("prefill_total_tokens: %d\n", this->prefill_total_tokens);
+    //printf("prefill_total_time: %f\n", this->prefill_total_time);
+
+      picojson::object config;
+     config["logprobes"] = picojson::value(sum);
+     config["is_greedy"] = picojson::value(is_greedy);
+     config["prefill_speed"]= picojson::value(this->prefill_total_tokens / this->prefill_total_time);
+     ////printf("prefill_total_tokens: %d\n", this->prefill_total_tokens);
+     //printf("prefill_speed: %f\n", this->prefill_total_tokens / this->prefill_total_time);
+     logits_on_cpu_ = NDArray{nullptr};  // Reinitialize or reset logits_on_cpu_
+     return picojson::value(config).serialize(true);
+
+     //return std::move(logprobes);;
+   }
+
 
   bool Stopped() { return stop_triggered_; }
 
@@ -1211,6 +1306,121 @@ class LLMChat {
     }
   }
 
+
+
+    /*!
+    * \brief Sample output pair of logprobs and is_greedy from logits on device
+    */
+   std::pair<float, bool> SampleLogProbeFromLogits(NDArray logits_on_device,
+                                        std::vector<int32_t> continuation_tokens,
+                                        picojson::object generation_config = picojson::object()
+                                        ) {
+     //printf("logits shape: %d\n", logits_on_device.Shape().size());
+     
+     // print logits_on_cpu_->ndim
+     //printf("logits_on_cpu_->ndim: %d\n", logits_on_device->ndim);
+     size_t seq_length = logits_on_device->shape[logits_on_device->ndim - 2];
+     //printf("seq_length: %d\n", seq_length);
+     size_t vocab_length =  logits_on_device->shape[ logits_on_device->ndim - 1];
+     //printf("vocab_length: %d\n", vocab_length);
+
+     this->UpdateLogitsOrProbOnCPUSync(logits_on_device);
+     //const float* logits_on_device_data = static_cast<float*>(logits_on_device->data);
+     //printf("logits_on_device_data: %f\n", logits_on_device_data[0]);
+     NDArray logprobs = this->SampleLogProbsFromLogitsOnCPU();
+     //printf("logprobs shape: %d\n", logprobs.Shape().size());
+     //size_t seq_length = logprobs->shape[logprobs->ndim - 2];
+     //printf("seq_length: %d\n", seq_length);
+     //size_t vocab_length = logprobs->shape[logprobs->ndim - 1];
+     //printf("vocab_length: %d\n", vocab_length);
+     const float* data = static_cast<float*>(logprobs->data);
+      // 使用new操作符分配内存并初始化为0
+
+/*
+      float* data = new float[seq_length * vocab_length]();  // 默认初始化为 0
+      for (int i = 0; i < seq_length; ++i) {
+          float max_logit = -INFINITY;
+          for (int j = 0; j < vocab_length; ++j) {
+              if (logits_on_device_data[i * vocab_length + j] > max_logit) {
+                  max_logit = logits_on_device_data[i * vocab_length + j];
+              }
+          }
+
+          // Calculate the softmax denominator
+          float sum = 0.0f;
+          for (int j = 0; j < vocab_length; ++j) {
+              sum += expf(logits_on_device_data[i * vocab_length + j] - max_logit);
+          }
+
+          // Now calculate the log-probabilities
+          for (int j = 0; j < vocab_length; ++j) {
+              float softmax_prob = expf(logits_on_device_data[i * vocab_length + j] - max_logit) / sum;
+              data[i * vocab_length + j] = logf(softmax_prob);
+          }
+      }
+
+*/
+     //printf("data: %f\n", data[0]); 
+     size_t continuation_length = continuation_tokens.size();
+     //printf("continuation_length: %d\n", continuation_length);
+     // Calculate is_greedy
+     std::vector<int32_t> greedy_tokens = this->LogProbsArgmax(data, seq_length, vocab_length);
+     bool is_greedy = true;
+     size_t offset = seq_length - continuation_length;
+     //printf("offset: %d\n", offset);
+     //printf("continuation_length: %d\n", continuation_length);
+     for (size_t i = 0; i < continuation_length; ++i) {
+       if (greedy_tokens[i + offset] != continuation_tokens[i]) {
+         is_greedy = false;
+         break;
+       }
+     }
+
+     // Calculate log probs sum for continuation_tokens indeces
+     float sum = 0;
+     int32_t offset_index = offset * vocab_length;
+     for (int32_t i = 0; i < continuation_length; ++i) {
+       int32_t index = offset_index + i * vocab_length + continuation_tokens[i];
+       sum += data[index];
+       //printf("data[%d]: %f\n", index, data[index]);
+     }
+
+     //delete[] data;
+     /*
+     picojson::object config;
+     config["logprobes"] = picojson::value(sum);
+     config["is_greedy"] = picojson::value(is_greedy);
+     config["prefill_speed"]= picojson::value(this->prefill_total_tokens / this->prefill_total_time);
+     //printf("prefill_total_tokens: %d\n", this->prefill_total_tokens);
+     printf("prefill_speed: %f\n", this->prefill_total_tokens / this->prefill_total_time);
+     return picojson::value(config).serialize(true);
+     */
+      return std::make_pair(sum, is_greedy);
+   }
+
+   /*!
+    * \brief Argmax calculated for logprobs
+    */
+   std::vector<int32_t> LogProbsArgmax(const float* in_logprobs, size_t seq_length,
+                                       int32_t vocab_length) {
+     std::vector<int32_t> res(seq_length);
+
+     for (size_t seq_ind = 0; seq_ind < seq_length; ++seq_ind) {
+       // Find max and its index in the slice
+       const float* logprobs = in_logprobs + vocab_length * seq_ind;
+       float max_value = logprobs[0];
+       int32_t maxarg_ind = 0;
+       for (int32_t i = 0; i < vocab_length; ++i) {
+         if (max_value < logprobs[i]) {
+           max_value = logprobs[i];
+           maxarg_ind = i;
+         }
+       }
+
+       res[seq_ind] = maxarg_ind;
+     }
+     return res;
+   }
   /*!
    * \brief Sample output token from logits on device
    */
@@ -1261,6 +1471,14 @@ class LLMChat {
     this->sample_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
     return next_token;
   }
+
+
+
+
+  /*!
+    * \brief Sample output pair of logprobs and is_greedy from logits on device
+    */
+  
 
   /*!
    * \brief Add a generated token and check for stop condition.
@@ -1358,7 +1576,8 @@ class LLMChat {
   }
 
   // run forward compute
-  NDArray ForwardTokens(std::vector<int32_t> input_tokens, int64_t cur_pos) {
+  NDArray ForwardTokens(std::vector<int32_t> input_tokens, int64_t cur_pos,bool need_logprobes = false) {
+    //printf("ForwardTokens\n");
     ObjectRef ret{nullptr};
     if (input_tokens.size() > 1 && ft_.prefill_func_.defined()) {
       ObjectRef input_data = ft_.CopyToWorker0(this->GetInputTokenNDArray(input_tokens));
@@ -1429,11 +1648,15 @@ class LLMChat {
         }
       }
     }
+    size_t index = 0;
+     if (need_logprobes) {
+       index =2  ;
+     }
     if (ft_.use_disco) {
       Array<ObjectRef> result = Downcast<DRef>(ret)->DebugGetFromRemote(0);
-      return Downcast<NDArray>(result[0]);
+      return Downcast<NDArray>(result[index]);
     } else {
-      return Downcast<Array<NDArray>>(ret)[0];
+      return Downcast<Array<NDArray>>(ret)[index];
     }
   }
 
@@ -1458,7 +1681,7 @@ class LLMChat {
   }
 
   // run forward compute with embeddings
-  NDArray ForwardEmbeddings(NDArray embeddings, int64_t cur_pos) {
+  NDArray ForwardEmbeddings(NDArray embeddings, int64_t cur_pos, bool need_logprobes = false) {
     if (ft_.use_disco) {
       LOG(FATAL) << "NotImplementedError: Distributed inference is not supported for this model";
       throw;
@@ -1466,7 +1689,14 @@ class LLMChat {
     Array<ObjectRef> ret;
     CHECK(ft_.prefill_with_embed_func_.defined());
     ret = ft_.prefill_with_embed_func_(embeddings, ShapeTuple({cur_pos}), kv_cache_, params_);
-    return Downcast<NDArray>(ret[0]);
+
+    if (need_logprobes) {
+       // All logits return
+       return Downcast<NDArray>(ret[2]);
+     } else {
+       // The last set of logits return only
+       return Downcast<NDArray>(ret[0]);
+     }
   }
 
   NDArray Softmax(NDArray input, NDArray temperature_arr) {
@@ -1529,6 +1759,7 @@ class LLMChat {
 
   void UpdateLogitsOrProbOnCPUSync(NDArray logits_or_prob) {
     if (!logits_on_cpu_.defined()) {
+      //printf("logits_on_cpu_ is not defined\n");
       logits_on_cpu_ = logits_or_prob.CopyTo(DLDevice{kDLCPU, 0});
     } else {
       ICHECK_EQ(logits_on_cpu_->shape[0], logits_or_prob->shape[0])
@@ -1567,6 +1798,16 @@ class LLMChat {
     return fsample_topp_from_prob_(logits_on_cpu_, top_p, GetRandomNumber());
   }
 
+
+   NDArray SampleLogProbsFromLogitsOnCPU() {
+     ICHECK(logits_on_cpu_.defined()) << "logits_on_cpu_ is not defined";
+     ICHECK_EQ(logits_on_cpu_->ndim, 3) << "logits_on_cpu_ should be 3D";
+     ICHECK_EQ(logits_on_cpu_->shape[0], 1) << "logits_on_cpu_ should be 1 batch";
+     auto log_probs =
+         NDArray::Empty(logits_on_cpu_.Shape(), logits_on_cpu_.DataType(), DLDevice{kDLCPU, 0});
+     flog_softmax_(logits_on_cpu_, log_probs);
+     return log_probs;
+   }
   //----------------------------
   // Statistics
   //----------------------------
@@ -1642,6 +1883,8 @@ class LLMChat {
   PackedFunc fsample_topp_from_logits_;
   // sample top p from prob
   PackedFunc fsample_topp_from_prob_;
+
+  PackedFunc flog_softmax_;
   // input token id
   NDArray input_token_ids_{nullptr};
   // local params
@@ -1810,6 +2053,19 @@ class LLMChatModule : public ModuleNode {
       return PackedFunc([this, sptr_to_self](TVMArgs args, TVMRetValue* rv) {
         GetChat()->ProcessSystemPrompts();
       });
+    } else if (name == "loglikelihood") {
+       return PackedFunc([this, sptr_to_self](TVMArgs args, TVMRetValue* rv) {
+         ICHECK(2 <= args.size() && args.size() <= 3);
+         //printf("loglikelihood\n");
+         if (args.size() == 2) {
+           // TODO(vvchernov): upstream TVMRetValue* with std::pair<float, bool>
+           *rv = GetChat()->LogLikelihoodStep(args[0], args[1]);
+         } else if (args.size() == 3) {
+           // args: generation_config_str
+          //printf("loglikelihood\n");
+          *rv = GetChat()->LogLikelihoodStep(args[0], args[1], args[2]);
+         }
+       });
     } else {
       return PackedFunc(nullptr);
     }

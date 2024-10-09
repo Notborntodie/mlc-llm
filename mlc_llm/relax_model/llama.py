@@ -848,7 +848,30 @@ class LlamaForCausalLM(nn.Module):
             all_seq_len_shape=all_seq_len_shape,
             past_key_values=past_key_values,
         )
+        
+        logits = self.lm_head(hidden_states)
+        if logits.struct_info.dtype != "float32":
+             logits = nn.emit(relax.op.astype(logits, "float32"))
+        def te_slicing(x: te.Tensor):
+             assert x.ndim == 3
+             return te.compute(
+                shape=(x.shape[0], 1, x.shape[2]),
+                fcompute=lambda i, j, k: x[i, x.shape[1] - 1, k],
+                name="slice",
+            )
+        
+        if hidden_states.struct_info.shape[1] != 1:
+             if logit_positions is None:
+                 last_logits = nn.emit_te(te_slicing, logits, primfunc_name_hint="slice")
+             else:
+                 last_logits = relax.op.take(logits, logit_positions, axis=1)
+        else:
+            last_logits = logits
+            
+        return last_logits, key_value_cache, logits
 
+
+'''
         def te_slicing(x: te.Tensor):
             assert x.ndim == 3
             return te.compute(
@@ -868,7 +891,7 @@ class LlamaForCausalLM(nn.Module):
             logits = nn.emit(relax.op.astype(logits, "float32"))
 
         return logits, key_value_cache
-
+'''
 
 def get_param_quant_kind(name: str, param_info: relax.TensorStructInfo) -> ParamQuantKind:
     if "embed_tokens" in name:
@@ -937,6 +960,20 @@ def create_prefill_func_for_single_seq(
                 [relax.ObjectStructInfo() for _ in range(config.num_hidden_layers * 2)]
             ),
         )
+
+
+
+        with bb.dataflow():
+             last_logits, key_value_cache, logits = model(
+                 inputs, all_seq_len_shape, past_key_values=past_key_values
+             )
+             params = [
+                 inputs,
+                 all_seq_len_shape,
+                 past_key_values,
+             ] + model.parameters()
+             gv = bb.emit_output((last_logits, relax.Tuple(key_value_cache), logits))
+        '''
         with bb.dataflow():
             logits, key_value_cache = model(
                 inputs, all_seq_len_shape, past_key_values=past_key_values
@@ -947,6 +984,7 @@ def create_prefill_func_for_single_seq(
                 past_key_values,
             ] + model.parameters()
             gv = bb.emit_output((logits, relax.Tuple(key_value_cache)))
+        '''
         bb.emit_func_output(gv, params)
 
     mod = bb.get()
@@ -977,14 +1015,14 @@ def create_prefill_func_for_batching(
         logit_pos = nn.Placeholder((bsz,), dtype="int32", name="logit_positions")
         past_key_values = relax.Var("kv_cache", relax.ObjectStructInfo())
         with bb.dataflow():
-            logits, key_value_cache = model(
+            last_logits, key_value_cache,logits = model(
                 inputs,
                 all_seq_len_shape=None,
                 past_key_values=past_key_values,
                 logit_positions=logit_pos,
             )
             params = [inputs, logit_pos, past_key_values] + model.parameters()
-            gv = bb.emit_output((logits, key_value_cache))
+            gv = bb.emit_output((last_logits, key_value_cache,logits))
         bb.emit_func_output(gv, params)
 
     mod = bb.get()
@@ -1016,7 +1054,7 @@ def create_decoding_func_for_single_seq(
             ),
         )
         with bb.dataflow():
-            logits, key_value_cache = model(
+            last_logits, key_value_cache ,logits= model(
                 input_ids, all_seq_len_shape, past_key_values=past_key_values
             )
             params = [
@@ -1024,7 +1062,7 @@ def create_decoding_func_for_single_seq(
                 all_seq_len_shape,
                 past_key_values,
             ] + model.parameters()
-            gv = bb.emit_output((logits, relax.Tuple(key_value_cache)))
+            gv = bb.emit_output((last_logits, relax.Tuple(key_value_cache),logits))
         bb.emit_func_output(gv, params)
 
     mod = bb.get()
@@ -1049,13 +1087,13 @@ def create_decoding_func_for_batching(
         param_manager.register_params(model, func_name, quant_scheme, get_param_quant_kind)
 
         inputs = nn.Placeholder((bsz, 1, hidden_size), dtype=config.dtype, name="inputs_embeds")
-        past_key_values = relax.Var("kv_cache", relax.ObjectStructInfo())
+        last_logits,past_key_values,logits = relax.Var("kv_cache", relax.ObjectStructInfo())
         with bb.dataflow():
             logits, key_value_cache = model(
                 inputs, all_seq_len_shape=None, past_key_values=past_key_values
             )
             params = [inputs, past_key_values] + model.parameters()
-            gv = bb.emit_output((logits, key_value_cache))
+            gv = bb.emit_output((last_logits, key_value_cache,logits))
         bb.emit_func_output(gv, params)
 
     mod = bb.get()
@@ -1088,13 +1126,13 @@ def create_verification_func_for_batching(
         )
         past_key_values = relax.Var("kv_cache", relax.ObjectStructInfo())
         with bb.dataflow():
-            logits, key_value_cache = model(
+            last_logits, key_value_cache ,logits= model(
                 inputs,
                 all_seq_len_shape=None,
                 past_key_values=past_key_values,
             )
             params = [inputs, past_key_values] + model.parameters()
-            gv = bb.emit_output((logits, key_value_cache))
+            gv = bb.emit_output((last_logits, key_value_cache,logits))
         bb.emit_func_output(gv, params)
 
     mod = bb.get()

@@ -96,8 +96,8 @@ Conversation LlamaDefault() {
 Conversation Llama2() {
   Conversation conv;
   conv.name = "llama-2";
-  conv.system =
-      ("[INST] <<SYS>>\nYou are a helpful, respectful and honest assistant.\n<</SYS>>\n\n ");
+  //conv.system =
+  //    ("[INST] <<SYS>>\nYou are a helpful, respectful and honest assistant.\n<</SYS>>\n\n ");
   conv.roles = {"[INST]", "[/INST]"};
   conv.messages = {};
   conv.offset = 0;

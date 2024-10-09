@@ -32,6 +32,8 @@ from .interface.openai_api import (
     DeltaMessage,
     EmbeddingsRequest,
     EmbeddingsResponse,
+    LogprobRequest,
+    LogprobResponse,
     ToolCalls,
     ToolChoice,
     UsageInfo,
@@ -272,7 +274,7 @@ async def request_chat_completion(request: ChatCompletionRequest):
         n=request.n,
         stop=request.stop,
     )
-
+    print(request.messages)
     session["chat_mod"].reset_chat()  # Reset previous history, KV cache, etc.
 
     use_function_call = function_call_util(request)
@@ -445,6 +447,40 @@ async def request_embeddings(request: EmbeddingsRequest):
         data=data, usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
     )
 
+
+
+
+@app.post("/v1/logprob")
+async def request_logprob(request: LogprobRequest):
+    """
+    Creates a logprob for a given context and continuation.
+    """
+
+    generation_config = GenerationConfig()
+
+    session["chat_mod"].reset_chat()
+
+    logprob_dict_str = session["chat_mod"]._logprob(  # pylint: disable=protected-access
+        context=request.context,
+        continuation=request.continuation,
+        generation_config=generation_config,
+    )
+    import json  # pylint: disable=import-outside-toplevel
+
+    #print(f"Raw logprob_dict_str: {logprob_dict_str}")  # 检查输出的内容
+    #print(logprob_dict_str)
+    logprob_dict = json.loads(logprob_dict_str)
+    logprob = logprob_dict["logprobes"]
+    is_greedy = logprob_dict["is_greedy"]
+    prefill_speed=logprob_dict["prefill_speed"]
+
+    return LogprobResponse(
+        logprob=logprob,
+        is_greedy=is_greedy,
+        # TODO: Fill in correct usage info
+        prefill_speed=prefill_speed,
+        usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+    )
 
 @app.post("/chat/reset")
 async def reset():

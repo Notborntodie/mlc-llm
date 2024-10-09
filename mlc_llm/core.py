@@ -38,6 +38,7 @@ from tvm import relax
 from tvm.contrib.nvcc import parse_compute_version
 from tvm.relax.backend import get_patterns_with_prefix
 from tvm.relax.backend.contrib.cutlass import annotate_workspace
+from tvm.contrib import graph_executor
 
 
 @dataclass
@@ -475,6 +476,7 @@ def _setup_model_path(args: argparse.Namespace):  # pylint: disable=too-many-bra
             )
         else:
             args.model = os.path.basename(args.hf_path)
+            print(f'Using model name "{args.model}" from "--hf-path"')
         args.model_path = os.path.join(args.artifact_path, "models", args.model)
         if os.path.exists(args.model_path):
             print(f"Weights exist at {args.model_path}, skipping download.")
@@ -713,6 +715,7 @@ def dump_mlc_chat_config(
 
 
 def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
+    #mod_deploy.show()
     target_kind = args.target_kind
     if args.system_lib_prefix:
         mod_deploy = mod_deploy.with_attrs({"system_lib_prefix": args.system_lib_prefix})
@@ -733,6 +736,19 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
                 mod_deploy = mlc_llm.dispatch.DispatchTIROperatorAdreno()(  # pylint: disable=not-callable
                     mod_deploy
                 )
+                            # 指定输出文件的路径
+            output_file = 'primfunc_before_build.txt'
+
+            # 打开文件进行写入
+            with open(output_file, 'w') as f:
+                # 遍历 mod_deploy 中的所有函数
+                for g_var, func in mod_deploy.functions.items():
+                    # 检查是否为 PrimFunc 类型
+                    if isinstance(func, tvm.tir.PrimFunc):
+                        # 将函数名称和内容写入文件
+                        f.write(f"PrimFunc name: {g_var.name_hint}\n")
+                        f.write(str(func) + "\n")
+                        f.write("=" * 80 + "\n")  # 分隔线用于区分不同函数
             mod_deploy = dl.ApplyDefaultSchedule(  # pylint: disable=not-callable
                 dl.gpu.Matmul(),
                 dl.gpu.GEMV(),
@@ -745,6 +761,17 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
                     mod_deploy
                 )
             )
+            output_file = 'primfunc_after_build.txt'
+            # 打开文件进行写入
+            with open(output_file, 'w') as f:
+                # 遍历 mod_deploy 中的所有函数
+                for g_var, func in mod_deploy.functions.items():
+                    # 检查是否为 PrimFunc 类型
+                    if isinstance(func, tvm.tir.PrimFunc):
+                        # 将函数名称和内容写入文件
+                        f.write(f"PrimFunc name: {g_var.name_hint}\n")
+                        f.write(str(func) + "\n")
+                        f.write("=" * 80 + "\n")  # 分隔线用于区分不同函数
         if not args.enable_batching:
             mod_deploy = tvm.tir.transform.ForceNarrowIndexToInt32()(mod_deploy)
 
@@ -838,7 +865,22 @@ def build_model_from_args(args: argparse.Namespace):
         mod, param_manager, params, model_config = model_generators[args.model_category].get_model(
             args, config
         )
+        '''
+        #mod.show()
 
+        #graph_mod = graph_executor.GraphModule(mod["prefill"](tvm.cpu()))
+        graph_mod = graph_executor.GraphModule(mod["prefill"], device=tvm.cpu(0))
+
+        # 导出计算图为 JSON 格式
+        graph_json = graph_mod.get_graph_json()
+
+        # 将 JSON 格式的计算图保存到文件
+        output_file = "origin.json"
+        with open(output_file, "w") as f:
+            f.write(graph_json)
+
+        print(f"Graph JSON has been successfully saved to {output_file}")
+        '''
         if args.model_category == "mistral":
             args.sliding_window = model_config.sliding_window
             args.attention_sink_size = model_config.attention_sink_size
