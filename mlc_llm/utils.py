@@ -316,6 +316,35 @@ def save_params(params: List[tvm.nd.NDArray], artifact_path: str, num_presharded
     )
 
 
+def save_beforeparams(params: List[tvm.nd.NDArray], artifact_path: str, num_presharded: int = 1) -> None:
+    from tvm.contrib import tvmjs  # pylint: disable=import-outside-toplevel
+
+    assert len(params) % num_presharded == 0
+    num_weights = len(params) // num_presharded
+
+    meta_data = {}
+    param_dict = {}
+    meta_data["ParamSize"] = len(params)
+    for i, nd in enumerate(params):
+        if num_presharded == 1:
+            param_name = f"param_{i}"
+        else:
+            expected_worker_id = i // num_weights
+            orig_param_id = i % num_weights
+            param_name = f"param_{orig_param_id}_shard-{expected_worker_id+1}-of-{num_presharded}"
+
+        param_dict[param_name] = nd
+
+    total_size_bytes = sum(
+        math.prod(param.shape) * np.dtype(param.dtype).itemsize for param in params
+    )
+    total_size_gb = total_size_bytes / (1024**3)
+    print(f"Total param size: {total_size_gb} GB")
+    tvmjs.dump_ndarray_cache(
+        param_dict, f"{artifact_path}/beforeparams", meta_data=meta_data, encode_format="raw"
+    )
+
+
 def load_params(artifact_path: str, device) -> List[tvm.nd.NDArray]:
     from tvm.contrib import tvmjs  # pylint: disable=import-outside-toplevel
 

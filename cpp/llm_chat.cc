@@ -1021,6 +1021,9 @@ class LLMChat {
     this->prefill_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
     this->prefill_total_tokens += token_len;
     this->ProcessNextToken(next_token, generation_config);
+    printf("prefill_total_tokens: %d\n", this->prefill_total_tokens);
+    printf("prefill_total_time: %f\n", this->prefill_total_time);
+    printf("prefill_speed: %f\n", this->prefill_total_tokens / this->prefill_total_time);
   }
 
   void DecodeStep(String generation_config_str = "") {
@@ -1127,8 +1130,9 @@ class LLMChat {
     this->prefill_total_tokens += token_len - 1;
     //printf("prefill_total_tokens: %d\n", this->prefill_total_tokens);
     //printf("prefill_total_time: %f\n", this->prefill_total_time);
-
-      picojson::object config;
+      
+      
+    picojson::object config;
      config["logprobes"] = picojson::value(sum);
      config["is_greedy"] = picojson::value(is_greedy);
      config["prefill_speed"]= picojson::value(this->prefill_total_tokens / this->prefill_total_time);

@@ -10,7 +10,7 @@ payload = {
     "continuation": " start performing cheer roping on a fake stage while many watch from the stands.",
  }
 
-response = requests.post("http://127.0.0.1:8000/v1/logprob", json=payload)
+response = requests.post("http://127.0.0.1:8080/v1/logprob", json=payload)
 if response.status_code != 200:
     print(f"Error: {response.status_code} - {response.text}")
 

@@ -981,6 +981,8 @@ def build_model_from_args(args: argparse.Namespace):
         if args.convert_weights_only:
             exit(0)
 
+
+        print("Optimize mod pipeline")
         mod = optimize_mod_pipeline(args, model_config)(mod)
         if args.num_shards > 1:
             # We require a "create_sharding_info" function for all
